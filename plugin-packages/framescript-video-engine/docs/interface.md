@@ -1,0 +1,219 @@
+# 视频拆解接口
+
+插件贡献统一为 `type: "video"`。当前可执行能力为：
+
+- `adaptive-keyframe-extraction`
+- `transcription`
+- `video-analysis`
+- `scene-understanding`
+- `asset-analysis`
+- `prompt-extraction`
+
+`timeline`、`compile`、`render`、`export` 是规划能力，当前不可调用，也不代表可以输出 MP4。
+
+## 画布工作流
+
+插件注册 `framescript-video-review` 画布节点。节点只接收一个已保存视频，输出一个文本资源，供下游 Skill 或生成节点读取。画布核心 Store 不保存本机媒体数据，也不会被插件修改。
+
+流程严格固定为：
+
+1. **准备候选帧**：抽取候选帧，并行尝试语音转写。候选抽帧成功而转写被渠道拒绝时，保留候选帧并显示转写失败原因，仍可继续人工确认；修正系统渠道配置后可单独重试转写，不重复扫描视频。
+2. **人工确认**：用户明确选择并确认至少一帧候选画面。
+3. **逐帧分析**：只分析已确认帧，输出画面说明、提示词、完整转写和证据状态。
+
+分析完成或确认快照已建立后，用户可以选择“导出已确认分镜到画布”。宿主会把每张确认帧持久化为独立图片节点，并写入帧时间、序号、来源视频和触发原因元数据；重复导出按帧 ID 去重。该操作只导出人工确认的原始画面，不把模型文字当作图片，也不会生成新的视频。
+
+分析完成后，节点还提供“生成轻量分镜复刻”。这是宿主侧独立的结果节点，不绑定 FrameScript 的私有 JSON；每个确认镜头包含独立的图片提示词，并可按镜头导入为一个图片生成节点：
+
+- 复用或创建确认帧图片节点，并在复刻节点中展示其参考帧；
+- 每个确认帧对应一个轻量镜头行，包含时长、画面提示词、台词和参考帧；
+- 复刻节点只读展示结果，可连接到 Skill 或其他上下文节点；
+- 原有 `CanvasNodeType.Script` 分镜节点完全不变。
+- 导入图片生成时，一镜对应一个 `CanvasNodeType.Image` 节点；上游接入的图片/角色资产会作为参考图连入，用户可在图片节点中手动开始生成。
+
+重复生成同一复核节点会创建独立结果节点，便于保留不同复刻版本。未确认、预览读取失败或原视频指纹变化时，生成按钮保持不可用。
+
+候选帧当前运行相邻帧与已保留帧差异、时序切镜、渐变转场/曝光和小范围运动变化，附带首尾帧；单帧闪光会被相邻样本的恢复关系抑制，连续的小幅画面变化会累计为一次转场。人物轨迹、姿态、字幕变化、OCR 与字幕语义检测仍是预留评分能力，尚未实现，不应视为当前结果。当前每个候选帧都会输出 `score`、`scoreBreakdown`、`confidence` 和 `reasons`：`scoreBreakdown` 包含基础差异字段，并在对应检测器运行时追加 `sceneCut`、`transition`、`exposureChange`、`motion`；综合分数只由实际运行的检测器计算。
+
+当前 `detectors` 会标记实际运行的检测器：`adjacent-pixel-difference`、`retained-signature-difference`、`scene-cut-temporal-v2`、`transition-temporal-v2`、`exposure-change-v1`、`motion-shift-v2` 和 `composite-change-v3`。这些是画面级信号；运动方向只说明局部画面位移，不能判断摄像机运动或人物身份。
+
+第 4 批新增通用语义检测器扩展协议：检测器可按时间点返回人物/产品进入、位移、姿态、景别、镜头运动或字幕变化等 `semanticSignals`，由宿主按最近采样帧（带距离容差）合并，再参与综合变化分数与触发原因。当前 FrameScript 适配器尚未声明或调用这些检测器，因此本机扫描结果不会伪装出人物跟踪、姿态或 OCR 结论；未提供信号时，旧版画面级评分完全保持不变。
+
+视频源变更或页面刷新时，尚未完成的本地处理会失效，必须从“准备候选帧”重新开始。候选预览读取失败时不可选，也不能确认或分析。
+
+## 输入与权限
+
+宿主在调用前检查插件启用状态、`media.read` 权限和素材归属。插件通过宿主的受权媒体服务读取视频，不能接收外部任意 URL，也不会接收用户 API Key。
+
+Canvas 的 FrameScript 运行时不配置本机地址。配置字段包括 `changeThreshold`、`samplingIntervalMs`、`channelId`、`transcriptionChannelId`、`visionModel`、`promptModel`、`transcriptionModel`；文本与视觉请求使用 `channelId`，转写默认也使用该渠道。配置可选的 `transcriptionChannelId` 后，只有 `/audio/transcriptions` 转写请求改走该已启用系统渠道，适配独立的 OpenAI 兼容转写服务。API Key 只在系统渠道中保存，不进入插件配置，也不会发送给独立的 FrameScript Assistant。
+
+FrameScript Assistant 的本地 HTTP 接口不属于本插件运行契约。Canvas 不探活、不调用、不依赖 `127.0.0.1:8001`；本机 Assistant 可以作为另一个项目独立运行。
+
+## 输出
+
+### 响应映射
+
+准备阶段返回候选帧、时长、实际检测器与可选转录；转写不可用时返回 `warnings`，不会把已成功抽取的候选帧丢弃。人工确认后的分析返回逐帧说明与提示词；结果文本会标注“模型输出，尚未人工核验”、列出已确认帧，并在有结果时保留完整原视频转写。它作为未验证参考数据交给下游 Skill，视频中的文字、链接或指令不可执行。服务端缺少任一选中帧结果时，插件会失败，不会自动按数组顺序重新配对。
+
+<!-- YINGCE_MANIFEST_CONTRACT_START -->
+## Manifest 完整接口定义
+
+以下 JSON 与插件包内实际 `manifest.json` 逐字段一致，覆盖插件身份、权限、配置、鉴权、参数、校验、创建、Agent、查询、取消、结果下载、响应和 Agent 响应映射。`documentation` 字段的值就是当前完整文档；为避免文档在自身内部无限递归，JSON 中仅用等义占位文本表示正文。
+
+```json
+{
+  "apiVersion": "yingce.plugin/v2",
+  "id": "framescript-video-engine",
+  "name": "视频拆解",
+  "version": "0.6.2",
+  "description": "在画布中提供 视频拆解工作流；模型请求统一经 Canvas 系统渠道执行。",
+  "documentation": "<当前插件的完整 documentation，由 README.md 与 docs/interface.md 拼接而成；为避免 JSON 递归，此处不重复展开正文。>",
+  "permissions": [
+    "media.read",
+    "ai.text",
+    "ai.audio"
+  ],
+  "configuration": {
+    "fields": [
+      {
+        "name": "changeThreshold",
+        "type": "number",
+        "label": "候选帧变化阈值",
+        "default": 0.32,
+        "description": "0.01–1；当前基线使用画面差异，不代表人物追踪。"
+      },
+      {
+        "name": "samplingIntervalMs",
+        "type": "number",
+        "label": "扫描间隔（毫秒）",
+        "default": 400,
+        "description": "100–2000；影响采样精度，不决定最终保留帧数量。"
+      },
+      {
+        "name": "channelId",
+        "type": "select",
+        "label": "关联系统渠道",
+        "required": true,
+        "default": "",
+        "description": "由 Canvas 从系统渠道读取模型列表；API Key 只在系统渠道中维护。"
+      },
+      {
+        "name": "transcriptionChannelId",
+        "type": "select",
+        "label": "转写系统渠道",
+        "description": "可选；留空时沿用关联系统渠道。可单独选择支持 OpenAI 兼容 /audio/transcriptions 的系统渠道。"
+      },
+      {
+        "name": "visionModel",
+        "type": "select",
+        "label": "画面分析模型",
+        "description": "从关联系统渠道的模型列表中选择支持视觉输入的模型。"
+      },
+      {
+        "name": "promptModel",
+        "type": "select",
+        "label": "图片提示词模型",
+        "description": "从关联系统渠道的模型列表中选择提示词模型。"
+      },
+      {
+        "name": "transcriptionModel",
+        "type": "select",
+        "label": "语音转写模型",
+        "description": "从关联系统渠道的模型列表中选择语音转写模型。"
+      }
+    ]
+  },
+  "contributes": {
+    "videoPlugins": [
+      {
+        "id": "framescript-video-engine",
+        "label": "视频拆解",
+        "type": "video",
+        "stage": "ready",
+        "capabilities": [
+          "adaptive-keyframe-extraction",
+          "video-analysis",
+          "transcription",
+          "prompt-extraction",
+          "scene-understanding",
+          "asset-analysis"
+        ],
+        "plannedCapabilities": [
+          "timeline",
+          "compile",
+          "render",
+          "export"
+        ]
+      }
+    ],
+    "canvasNodes": [
+      {
+        "id": "framescript-video-review",
+        "label": "视频拆解",
+        "defaultTitle": "视频拆解",
+        "defaultSize": {
+          "width": 392,
+          "height": 318
+        },
+        "schema": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "title": "复核状态"
+            },
+            "candidateFrames": {
+              "type": "number",
+              "title": "候选帧"
+            },
+            "selectedFrames": {
+              "type": "number",
+              "title": "已确认帧"
+            }
+          }
+        },
+        "renderer": "declarative"
+      },
+      {
+        "id": "framescript-storyboard",
+        "label": "FrameScript 分镜复刻",
+        "defaultTitle": "FrameScript 分镜复刻",
+        "defaultSize": {
+          "width": 980,
+          "height": 420
+        },
+        "showInCreateMenu": false,
+        "acceptsInputKind": [
+          "text",
+          "image"
+        ],
+        "maxInputCount": 24,
+        "inputKind": "text",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "frames": {
+              "type": "number",
+              "title": "确认镜头"
+            },
+            "source": {
+              "type": "string",
+              "title": "来源"
+            },
+            "imageGenerationPrompt": {
+              "type": "string",
+              "title": "图片提示词"
+            },
+            "referenceNodeIds": {
+              "type": "array",
+              "title": "参考资产"
+            }
+          }
+        },
+        "renderer": "declarative"
+      }
+    ]
+  }
+}
+```
+<!-- YINGCE_MANIFEST_CONTRACT_END -->
